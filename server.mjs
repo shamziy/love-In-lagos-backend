@@ -26,7 +26,7 @@ if (!JWT_SECRET || JWT_SECRET.length < 24) { JWT_SECRET = crypto.randomBytes(32)
 
 const db = new DatabaseSync(DB_PATH);
 db.exec(`PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT UNIQUE NOT NULL,username TEXT UNIQUE NOT NULL COLLATE NOCASE,name TEXT NOT NULL,age INTEGER NOT NULL,gender TEXT NOT NULL,bio TEXT DEFAULT '',area TEXT DEFAULT '',fav TEXT DEFAULT '',look TEXT DEFAULT '[]',interests TEXT DEFAULT '[]',avatar TEXT DEFAULT '{}',photo TEXT DEFAULT '',loc INTEGER NOT NULL DEFAULT -1,seen INTEGER NOT NULL DEFAULT 0,bot INTEGER NOT NULL DEFAULT 0,pw TEXT NOT NULL,game TEXT DEFAULT '{}',created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,email TEXT UNIQUE NOT NULL,username TEXT UNIQUE NOT NULL COLLATE NOCASE,name TEXT NOT NULL,age INTEGER NOT NULL DEFAULT 0,gender TEXT NOT NULL DEFAULT '',bio TEXT DEFAULT '',area TEXT DEFAULT '',fav TEXT DEFAULT '',look TEXT DEFAULT '[]',interests TEXT DEFAULT '[]',avatar TEXT DEFAULT '{}',photo TEXT DEFAULT '',loc INTEGER NOT NULL DEFAULT -1,seen INTEGER NOT NULL DEFAULT 0,bot INTEGER NOT NULL DEFAULT 0,pw TEXT NOT NULL,game TEXT DEFAULT '{}',created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,from_id INTEGER NOT NULL,to_id INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',pct INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,UNIQUE(from_id,to_id));
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,from_id INTEGER NOT NULL,to_id INTEGER NOT NULL,text TEXT NOT NULL,created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS blocks(by_id INTEGER NOT NULL,user_id INTEGER NOT NULL,PRIMARY KEY(by_id,user_id));
@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS game_used(user_id INTEGER NOT NULL,q INTEGER NOT NULL
 CREATE TABLE IF NOT EXISTS profile_views(viewer_id INTEGER NOT NULL,viewed_id INTEGER NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(viewer_id,viewed_id));
 CREATE TABLE IF NOT EXISTS activity(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL,created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS daily_answers(user_id INTEGER NOT NULL,day TEXT NOT NULL,q TEXT NOT NULL,answer TEXT NOT NULL,correct TEXT NOT NULL,ok INTEGER NOT NULL,created INTEGER NOT NULL,PRIMARY KEY(user_id,day));`);
+db.exec("CREATE TABLE IF NOT EXISTS resets(user_id INTEGER PRIMARY KEY,code TEXT NOT NULL,exp INTEGER NOT NULL,tries INTEGER NOT NULL DEFAULT 0)");
+try { db.exec("ALTER TABLE users ADD COLUMN tv INTEGER NOT NULL DEFAULT 0"); } catch {} // session version: a password reset bumps it, which signs out every other device
+for (const c of ["xp INTEGER NOT NULL DEFAULT 0", "boost_until INTEGER NOT NULL DEFAULT 0"]) try { db.exec("ALTER TABLE users ADD COLUMN " + c); } catch {}
+db.exec("CREATE TABLE IF NOT EXISTS xp_events(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,day TEXT NOT NULL,amount INTEGER NOT NULL,reason TEXT NOT NULL,created INTEGER NOT NULL)");
 const QCOUNT = 500; // must equal the number of questions in js/questions.js
 const one = (s, ...a) => db.prepare(s).get(...a), all = (s, ...a) => db.prepare(s).all(...a), run = (s, ...a) => db.prepare(s).run(...a);
 
@@ -44,16 +48,18 @@ const one = (s, ...a) => db.prepare(s).get(...a), all = (s, ...a) => db.prepare(
 const hash = pw => { const s = crypto.randomBytes(16); return s.toString("hex") + ":" + crypto.scryptSync(pw, s, 64).toString("hex"); };
 const check = (pw, h) => { const [s, k] = h.split(":"); return crypto.timingSafeEqual(crypto.scryptSync(pw, Buffer.from(s, "hex"), 64), Buffer.from(k, "hex")); };
 const mac = p => crypto.createHmac("sha256", JWT_SECRET).update(p).digest("base64url");
-const sign = uid => { const p = Buffer.from(JSON.stringify({ uid, exp: Date.now() + 30 * 864e5 })).toString("base64url"); return p + "." + mac(p); };
-const verify = t => { try { const [p, s] = t.split("."), ok = mac(p); if (s.length !== ok.length || !crypto.timingSafeEqual(Buffer.from(s), Buffer.from(ok))) return null; const d = JSON.parse(Buffer.from(p, "base64url")); return d.exp > Date.now() ? d.uid : null; } catch { return null; } };
+const sign = (uid, tv = 0) => { const p = Buffer.from(JSON.stringify({ uid, tv, exp: Date.now() + 30 * 864e5 })).toString("base64url"); return p + "." + mac(p); };
+const verify = t => { try { const [p, s] = t.split("."), ok = mac(p); if (s.length !== ok.length || !crypto.timingSafeEqual(Buffer.from(s), Buffer.from(ok))) return null; const d = JSON.parse(Buffer.from(p, "base64url")); return d.exp > Date.now() ? d : null; } catch { return null; } };
 
 const J = (t, d) => { try { return JSON.parse(t); } catch { return d; } };
 const UN = /^[a-z0-9_.]{3,20}$/;
 const cleanAv = a => { const o = {}; for (const k of ["sk", "hc", "sh", "bg"]) if (/^#[0-9a-f]{6}$/i.test(a?.[k])) o[k] = a[k]; for (const [k, mx] of [["hs", 4], ["ac", 3], ["mo", 2]]) if (Number.isInteger(a?.[k]) && a[k] >= 0 && a[k] <= mx) o[k] = a[k]; return o; };
-const pub = u => ({ id: u.id, username: u.username, name: u.name, age: u.age, gender: u.gender, bio: u.bio, area: u.area, interests: J(u.interests, []), avatar: J(u.avatar, {}), online: u.seen > Date.now() - 90000, loc: u.loc });
+const pub = u => ({ id: u.id, username: u.username, name: u.name, bio: u.bio, look: J(u.look, []), fav: u.fav, area: u.area, interests: J(u.interests, []), avatar: J(u.avatar, {}), online: u.seen > Date.now() - 90000, loc: u.loc });
 // "Your day on the app" log + the Daily question (days are Lagos days, UTC+1)
 const logA = (uid, kind, text) => run("INSERT INTO activity(user_id,kind,text,created) VALUES(?,?,?,?)", uid, kind, String(text).slice(0, 120), Date.now());
 const lagosDay = (off = 0) => new Date(Date.now() + 3600000 - off * 864e5).toISOString().slice(0, 10);
+// XP: every reward goes through award(). cap = most XP of that kind per Lagos day (0 = no cap)
+const award = (uid, n, why, cap = 0) => { if (cap) n = Math.min(n, cap - one("SELECT COALESCE(SUM(amount),0) s FROM xp_events WHERE user_id=? AND day=? AND reason=?", uid, lagosDay(), why).s); if (n <= 0) return 0; run("INSERT INTO xp_events(user_id,day,amount,reason,created) VALUES(?,?,?,?,?)", uid, lagosDay(), n, why, Date.now()); run("UPDATE users SET xp=xp+? WHERE id=?", n, uid); return n; };
 const DAILY = [ // by Lagos weekday, 0 = Sunday: [title, question, options, index of the correct option] (same as the app's data.js)
   ["Freedom Park Sunday", "How many players are on a 5-a-side team?", ["7", "5", "11"], 1],
   ["Rainy Monday", "Which yellow bus is the icon of Lagos roads?", ["Danfo", "Gondola", "Tuk-tuk"], 0],
@@ -71,9 +77,19 @@ const streak3 = (a, b) => {
   for (let i = 1; i < days.length; i++) { r = days[i] - days[i - 1] === 864e5 ? r + 1 : 1; if (r >= 3) return true; }
   return false;
 };
-// Match % = 40 + shared interests x15 + age closeness + a steady per-pair jitter (same for both people)
-const compat = (a, b) => { const ib = J(b.interests, []), ov = J(a.interests, []).filter(x => ib.includes(x)).length, ad = Math.abs(a.age - b.age), jit = crypto.createHash("sha256").update([a.id, b.id].sort((x, y) => x - y).join("|")).digest()[0] % 51 - 25; return Math.max(5, Math.min(100, 40 + ov * 15 + (ad <= 3 ? 10 : ad <= 7 ? 5 : 0) + jit)); };
-const full = u => ({ ...pub(u), email: u.email, photo: u.photo || "", fav: u.fav, look: J(u.look, []), game: J(u.game, {}) });
+// Match % = 12 + steady luck per pair (0-40) + similarity bonus (up to 60: interests 32, shared words in "about" 20, same area 5, same favourite spot 3). Similar people match more often, but people with empty profiles still get a fair chance.
+const STOP = new Set("this that with have from your about just like love lagos and the for are but you not who what when where been into than then them they their there here very much more some also".split(" "));
+const wordsOf = t => new Set((String(t || "").toLowerCase().match(/[a-z]{4,}/g) || []).filter(w => !STOP.has(w)));
+const compat = (a, b) => {
+  const ia = J(a.interests, []), ib = J(b.interests, []), la = J(a.look, []), lb = J(b.look, []), wb = wordsOf(b.bio);
+  const si = ia.filter(x => ib.includes(x)), sl = la.filter(x => lb.includes(x)), sw = [...wordsOf(a.bio)].filter(w => wb.has(w));
+  const ra = (n, x, y) => n / Math.max(1, Math.min(x, y)), sa = !!a.area && a.area === b.area, sf = !!a.fav && a.fav === b.fav;
+  const jit = crypto.createHash("sha256").update([a.id, b.id].sort((x, y) => x - y).join("|")).digest()[0] % 41; // steady luck for each pair, same for both people
+  const sim = 32 * ra(si.length, ia.length, ib.length) + 20 * Math.min(1, sw.length / 3) + (sa ? 5 : 0) + (sf ? 3 : 0);
+  const pct = Math.round(Math.min(100, 12 + jit + sim));
+  return { pct, why: [...si, ...sw.slice(0, 2), ...(sa ? ["both in " + a.area] : [])].slice(0, 5) };
+};
+const full = u => ({ ...pub(u), xp: u.xp, boost: u.boost_until, email: u.email, photo: u.photo || "", fav: u.fav, look: J(u.look, []), game: J(u.game, {}) });
 const blocked = (a, b) => !!one("SELECT 1 x FROM blocks WHERE (by_id=? AND user_id=?) OR (by_id=? AND user_id=?)", a, b, b, a);
 const friends = (a, b) => !!one("SELECT 1 x FROM requests WHERE status='accepted' AND ((from_id=? AND to_id=?) OR (from_id=? AND to_id=?))", a, b, b, a);
 
@@ -82,6 +98,11 @@ const hits = new Map();
 const limit = (ip, k, max) => { const key = ip + k, n = Date.now(), h = hits.get(key); if (!h || h[1] < n) { hits.set(key, [1, n + 6e4]); return true; } return ++h[0] <= max; };
 setInterval(() => hits.clear(), 5 * 6e4).unref();
 
+// Optional real emails for password resets: set RESEND_API_KEY (resend.com) and MAIL_FROM. No package needed.
+async function sendMail(to, subject, text) {
+  const key = process.env.RESEND_API_KEY; if (!key) return false;
+  try { const r = await fetch("https://api.resend.com/emails", { method: "POST", headers: { Authorization: "Bearer " + key, "Content-Type": "application/json" }, body: JSON.stringify({ from: process.env.MAIL_FROM || "Love in Lagos <onboarding@resend.dev>", to: [to], subject, text }) }); return r.ok; } catch { return false; }
+}
 function route(m, p, url, b, send, ip, req) {
   if (p === "/health" || p === "/api/health") return send(200, { ok: true });
 
@@ -91,30 +112,53 @@ function route(m, p, url, b, send, ip, req) {
   }
   if (p === "/api/signup" && m === "POST") {
     if (!limit(ip, "auth", 30)) return send(429, { error: "Too many attempts. Try again in a minute." });
-    const username = String(b.username || "").trim().toLowerCase(), name = username, email = String(b.email || "").trim().toLowerCase(), age = +b.age,
-      gender = String(b.gender || "").slice(0, 20), bio = String(b.bio || "").slice(0, 160), pw = String(b.password || "");
+    const username = String(b.username || "").trim().toLowerCase(), name = username, email = String(b.email || "").trim().toLowerCase(), bio = String(b.bio || "").slice(0, 160), pw = String(b.password || "");
     if (!UN.test(username)) return send(400, { error: "Username: 3-20 letters, numbers, _ or ." });
-    if (!(age >= 18 && age <= 99)) return send(400, { error: "You must be 18 or older" });
     if (!/^\S+@\S+\.\S+$/.test(email)) return send(400, { error: "Enter a valid email" });
     if (pw.length < 8) return send(400, { error: "Password must be at least 8 characters" });
     if (one("SELECT 1 x FROM users WHERE email=?", email)) return send(409, { error: "That email already has an account" });
     if (one("SELECT 1 x FROM users WHERE username=?", username)) return send(409, { error: "That username is already taken" });
     const photo = PHOTO.test(b.photo || "") && b.photo.length <= 150000 ? b.photo : ""; // optional, stays private until 100 messages
-    const r = run("INSERT INTO users(email,username,name,age,gender,bio,avatar,photo,pw,created) VALUES(?,?,?,?,?,?,?,?,?,?)", email, username, name, age, gender, bio, JSON.stringify(cleanAv(b.avatar)), photo, hash(pw), Date.now());
+    let r; try { r = run("INSERT INTO users(email,username,name,age,gender,bio,avatar,photo,pw,created) VALUES(?,?,?,0,'',?,?,?,?,?)", email, username, name, bio, JSON.stringify(cleanAv(b.avatar)), photo, hash(pw), Date.now()); } catch { return send(409, { error: "That username or email is already taken" }); }
     const u = one("SELECT * FROM users WHERE id=?", r.lastInsertRowid);
-    return send(201, { token: sign(u.id), user: full(u) });
+    return send(201, { token: sign(u.id, u.tv), user: full(u) });
   }
   if (p === "/api/login" && m === "POST") {
     if (!limit(ip, "auth", 30)) return send(429, { error: "Too many attempts. Try again in a minute." });
-    const u = one("SELECT * FROM users WHERE email=?", String(b.email || "").trim().toLowerCase());
-    if (!u || !check(String(b.password || ""), u.pw)) return send(401, { error: "Incorrect email or password" });
-    return send(200, { token: sign(u.id), user: full(u) });
+    const idf = String(b.identifier || b.email || "").trim().toLowerCase(), u = one("SELECT * FROM users WHERE email=? OR username=?", idf, idf); // log in with email OR username
+    if (!u || !check(String(b.password || ""), u.pw)) return send(401, { error: "Incorrect email/username or password" });
+    return send(200, { token: sign(u.id, u.tv), user: full(u) });
+  }
+
+  if (p === "/api/forgot" && m === "POST") { // forgot password, step 1: a 6-digit code (valid 15 min). The answer is always the same, so nobody can test which accounts exist
+    if (!limit(ip, "fg", 8)) return send(429, { error: "Too many attempts. Try again in a minute." });
+    const id = String(b.identifier || "").trim().toLowerCase(), x = id && one("SELECT * FROM users WHERE bot=0 AND (email=? OR username=?)", id, id), out = { ok: true, message: "If that account exists, a 6-digit code was sent to its email. It works for 15 minutes." };
+    if (!x) return send(200, out);
+    const code = String(crypto.randomInt(0, 1e6)).padStart(6, "0");
+    run("INSERT OR REPLACE INTO resets(user_id,code,exp,tries) VALUES(?,?,?,0)", x.id, mac("rs" + x.id + ":" + code), Date.now() + 15 * 6e4);
+    sendMail(x.email, "Your Love in Lagos reset code", `Your code is ${code}. It works for 15 minutes. If you did not ask for it, ignore this email.`).then(sent => {
+      if (!sent) console.log(`[password reset] no email service set. Code for @${x.username}: ${code}`);
+      send(200, !sent && DEMO !== "false" ? { ...out, devCode: code } : out); // devCode is only shown while DEMO is on and no email service is set
+    }).catch(() => send(500, { error: "Server error" }));
+    return;
+  }
+  if (p === "/api/reset" && m === "POST") { // step 2: code + new password
+    if (!limit(ip, "rs", 10)) return send(429, { error: "Too many attempts. Try again in a minute." });
+    const id = String(b.identifier || "").trim().toLowerCase(), x = id && one("SELECT * FROM users WHERE bot=0 AND (email=? OR username=?)", id, id), rr = x && one("SELECT * FROM resets WHERE user_id=?", x.id), pw = String(b.password || "");
+    if (pw.length < 8) return send(400, { error: "Password must be at least 8 characters" });
+    const bad = { error: "That code is wrong or expired. Ask for a new one." };
+    if (!rr || rr.exp < Date.now() || rr.tries >= 5) return send(400, bad);
+    const want = Buffer.from(rr.code), got = Buffer.from(mac("rs" + x.id + ":" + String(b.code || "").trim()));
+    if (want.length !== got.length || !crypto.timingSafeEqual(want, got)) { run("UPDATE resets SET tries=tries+1 WHERE user_id=?", x.id); return send(400, bad); }
+    run("UPDATE users SET pw=?,tv=tv+1 WHERE id=?", hash(pw), x.id); run("DELETE FROM resets WHERE user_id=?", x.id); // tv+1 signs out all other devices
+    const nu = one("SELECT * FROM users WHERE id=?", x.id);
+    return send(200, { ok: true, token: sign(nu.id, nu.tv), user: full(nu) }); // the device that reset stays signed in
   }
 
   // Everything below needs a logged-in user
-  const uid = verify((req.headers.authorization || "").replace("Bearer ", ""));
+  const tk = verify((req.headers.authorization || "").replace("Bearer ", "")), uid = tk && tk.uid;
   const u = uid && one("SELECT * FROM users WHERE id=?", uid);
-  if (!u) return send(401, { error: "Please log in" });
+  if (!u || (tk.tv || 0) !== u.tv) return send(401, { error: "Please log in" });
 
   if (p === "/api/me" && m === "GET") return send(200, full(u));
   if (p === "/api/me" && m === "PUT") { // profile, bitmoji and game progress
@@ -139,10 +183,17 @@ function route(m, p, url, b, send, ip, req) {
     run("DELETE FROM blocks WHERE by_id=? OR user_id=?", uid, uid); run("DELETE FROM games WHERE a_id=? OR b_id=?", uid, uid); run("DELETE FROM game_used WHERE user_id=?", uid); run("DELETE FROM profile_views WHERE viewer_id=? OR viewed_id=?", uid, uid); run("DELETE FROM users WHERE id=?", uid);
     return send(200, { ok: true });
   }
+  const xpInfo = () => ({ total: one("SELECT xp FROM users WHERE id=?", uid).xp, today: one("SELECT COALESCE(SUM(amount),0) s FROM xp_events WHERE user_id=? AND day=? AND reason!='boost'", uid, lagosDay()).s, goal: 200, boostUntil: one("SELECT boost_until b FROM users WHERE id=?", uid).b, claimed: !!one("SELECT 1 x FROM xp_events WHERE user_id=? AND day=? AND reason='boost'", uid, lagosDay()) });
+  if (p === "/api/xp" && m === "GET") return send(200, xpInfo());
+  if (p === "/api/xp/boost" && m === "POST") { // Lagos Charm: earn 200 XP today, then every match you send is accepted automatically for 1 hour (once a day)
+    const i = xpInfo(); if (i.today < 200) return send(400, { error: "Earn 200 XP today first" }); if (i.claimed) return send(409, { error: "You already used today’s Lagos Charm" });
+    run("INSERT INTO xp_events(user_id,day,amount,reason,created) VALUES(?,?,0,'boost',?)", uid, lagosDay(), Date.now()); run("UPDATE users SET boost_until=? WHERE id=?", Date.now() + 36e5, uid); logA(uid, "daily", "⚡ Lagos Charm on for 1 hour");
+    return send(200, xpInfo());
+  }
   if (p === "/api/activity" && m === "POST") { // things only the app knows about (activities at locations, resting). Matches, games and the daily answer log themselves
     if (!["act", "rest"].includes(b.kind)) return send(400, { error: "Bad kind" });
     if (!limit(ip, "act", 120)) return send(429, { error: "Slow down" });
-    logA(uid, b.kind, b.text || "");
+    logA(uid, b.kind, b.text || ""); if (b.kind === "act") award(uid, 10, "act", 100);
     return send(200, { ok: true });
   }
   if (p === "/api/activity" && m === "GET") { // "Your day on the app": /api/activity?day=2026-10-10 (default today, Lagos time)
@@ -161,7 +212,7 @@ function route(m, p, url, b, send, ip, req) {
     const d = DAILY[new Date(Date.now() + 3600000).getUTCDay()], opt = Math.trunc(+b.option);
     if (!(opt >= 0 && opt < d[2].length)) return send(400, { error: "Pick one of the options" });
     if (one("SELECT 1 x FROM daily_answers WHERE user_id=? AND day=?", uid, lagosDay())) return send(409, { error: "Already answered today" });
-    const ok = opt === d[3];
+    const ok = opt === d[3]; award(uid, ok ? 30 : 10, "daily");
     run("INSERT INTO daily_answers(user_id,day,q,answer,correct,ok,created) VALUES(?,?,?,?,?,?,?)", uid, lagosDay(), d[1], d[2][opt], d[2][d[3]], ok ? 1 : 0, Date.now());
     logA(uid, "daily", "🗓️ Answered the daily question: " + d[2][opt] + (ok ? " ✅" : " ❌"));
     return send(200, { ok, correct: d[2][d[3]] });
@@ -184,18 +235,19 @@ function route(m, p, url, b, send, ip, req) {
     return send(200, all("SELECT * FROM users WHERE id!=? AND username LIKE ? AND id NOT IN (SELECT user_id FROM blocks WHERE by_id=?) AND id NOT IN (SELECT by_id FROM blocks WHERE user_id=?) ORDER BY id DESC LIMIT 50", uid, q, uid, uid).map(pub));
   }
   if (p === "/api/matches" && m === "POST") { // the Match button: <=20% is never sent, >=95% matches instantly
-    const to = +b.to, o = one("SELECT * FROM users WHERE id=?", to);
+    const to = +b.to, o = one("SELECT * FROM users WHERE id=?", to), boost0 = u.boost_until > Date.now();
     if (!o || to === uid || blocked(uid, to)) return send(400, { error: "Cannot match" });
     if (!limit(ip, "req", 30)) return send(429, { error: "Slow down" });
     const ex = one("SELECT * FROM requests WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)", uid, to, to, uid);
-    if (ex && ex.status === "pending" && ex.to_id === uid) { run("UPDATE requests SET status='accepted' WHERE id=?", ex.id); return send(200, { pct: ex.pct, status: "matched" }); }
+    if (ex && ex.status === "pending" && ex.to_id === uid) { run("UPDATE requests SET status='accepted' WHERE id=?", ex.id); award(uid, 25, "match"); award(to, 25, "match"); return send(200, { pct: ex.pct, status: "matched" }); }
+    if (ex && ex.status !== "accepted" && boost0) { run("UPDATE requests SET status='accepted' WHERE id=?", ex.id); award(uid, 25, "match"); award(to, 25, "match"); return send(200, { pct: ex.pct, status: "matched", boost: true }); }
     if (ex) return send(200, { pct: ex.pct, status: ex.status === "accepted" ? "matched" : ex.status === "declined" ? "declined" : "sent" });
-    const pct = compat(u, o);
-    if (pct <= 20) { logA(uid, "match", "💔 Match with @" + o.username + " didn't work out (" + pct + "%)"); return send(200, { pct, status: "low" }); } // nothing is stored or sent to them
-    const auto = pct >= 95;
+    const { pct, why } = compat(u, o), boost = u.boost_until > Date.now();
+    if (pct <= 20 && !boost) { logA(uid, "match", "💔 Match with @" + o.username + " didn't work out (" + pct + "%)"); return send(200, { pct, why, status: "low" }); } // nothing is stored or sent to them
+    const auto = pct >= 95 || boost; if (auto) { award(uid, 25, "match"); award(to, 25, "match"); } else award(uid, 5, "sent", 25);
     run("INSERT INTO requests(from_id,to_id,status,pct,created) VALUES(?,?,?,?,?)", uid, to, auto ? "accepted" : "pending", pct, Date.now());
     logA(uid, "match", (auto ? "💘 Instantly matched with @" : "💘 Sent a match to @") + o.username + " (" + pct + "%)");
-    return send(200, { pct, status: auto ? "matched" : "sent" });
+    return send(200, { pct, why, status: auto ? "matched" : "sent" });
   }
   if (p === "/api/matches" && m === "GET") // "Match requests" (incoming) and "Recent chats" (matches). talking=true after 4+ messages
     return send(200, {
@@ -209,7 +261,7 @@ function route(m, p, url, b, send, ip, req) {
     const r = one("SELECT * FROM requests WHERE id=? AND to_id=? AND status='pending'", +mm[1], uid);
     if (!r) return send(404, { error: "Match request not found" });
     run("UPDATE requests SET status=? WHERE id=?", b.accept ? "accepted" : "declined", r.id);
-    if (b.accept) { logA(uid, "match", "🎉 You accepted a match"); logA(r.from_id, "match", "🎉 Someone accepted your match"); }
+    if (b.accept) { award(uid, 25, "match"); award(r.from_id, 25, "match"); logA(uid, "match", "🎉 You accepted a match"); logA(r.from_id, "match", "🎉 Someone accepted your match"); }
     return send(200, { ok: true });
   }
   mm = p.match(/^\/api\/messages\/(\d+)$/); // chat: poll this every few seconds with ?after=<last id>
@@ -221,7 +273,7 @@ function route(m, p, url, b, send, ip, req) {
       const text = String(b.text || "").trim().slice(0, 500);
       if (!text) return send(400, { error: "Empty message" });
       if (!limit(ip, "msg", 120)) return send(429, { error: "Slow down" });
-      run("INSERT INTO messages(from_id,to_id,text,created) VALUES(?,?,?,?)", uid, other, text, Date.now());
+      run("INSERT INTO messages(from_id,to_id,text,created) VALUES(?,?,?,?)", uid, other, text, Date.now()); award(uid, 2, "msg", 40);
       return send(201, { ok: true });
     }
   }
@@ -254,7 +306,7 @@ function route(m, p, url, b, send, ip, req) {
     const text = String(b.text || "").trim().slice(0, 300);
     if (!text) return send(400, { error: "Write an answer" });
     run("INSERT INTO game_answers(game_id,qi,user_id,text,created) VALUES(?,?,?,?,?)", g.id, g.i, uid, text, Date.now());
-    if (g.i + 1 >= 20) { run("UPDATE games SET status='done',i=20,asked=0 WHERE id=?", g.id); logA(g.a_id, "game", "🎲 Finished 20 Questions"); logA(g.b_id, "game", "🎲 Finished 20 Questions"); }
+    if (g.i + 1 >= 20) { run("UPDATE games SET status='done',i=20,asked=0 WHERE id=?", g.id); logA(g.a_id, "game", "🎲 Finished 20 Questions"); award(g.a_id, 40, "game"); award(g.b_id, 40, "game"); logA(g.b_id, "game", "🎲 Finished 20 Questions"); }
     else run("UPDATE games SET i=i+1,asked=0 WHERE id=?", g.id);
     return send(200, { ok: true });
   }
@@ -354,7 +406,7 @@ const hnum = s => crypto.createHash("sha256").update(String(s)).digest()[0];
 const isBot = id => !!one("SELECT 1 x FROM users WHERE id=? AND bot=1", id);
 function botAnswer(g, uid) { // a resident answers the question they were asked
   run("INSERT INTO game_answers(game_id,qi,user_id,text,created) VALUES(?,?,?,?,?)", g.id, g.i, uid, pick(BOT_ANSWERS), Date.now());
-  if (g.i + 1 >= 20) { run("UPDATE games SET status='done',i=20,asked=0 WHERE id=?", g.id); logA(g.a_id, "game", "🎲 Finished 20 Questions"); logA(g.b_id, "game", "🎲 Finished 20 Questions"); }
+  if (g.i + 1 >= 20) { run("UPDATE games SET status='done',i=20,asked=0 WHERE id=?", g.id); logA(g.a_id, "game", "🎲 Finished 20 Questions"); award(g.a_id, 40, "game"); award(g.b_id, 40, "game"); logA(g.b_id, "game", "🎲 Finished 20 Questions"); }
   else run("UPDATE games SET i=i+1,asked=0 WHERE id=?", g.id);
 }
 function startDemo() {
@@ -370,7 +422,7 @@ function botTick() {
     run("UPDATE users SET seen=? WHERE bot=1", now);                                                        // residents stay online
     if (Math.random() < 0.08) run("UPDATE users SET loc=? WHERE id=?", Math.floor(Math.random() * 9), pick(bots).id); // and wander between places
     for (const r of all("SELECT r.* FROM requests r JOIN users u ON u.id=r.to_id WHERE r.status='pending' AND u.bot=1 AND r.created<?", now - 3500)) // decide on match requests
-      run("UPDATE requests SET status=? WHERE id=?", hnum(r.id) % 100 < (r.pct >= 50 ? 85 : 55) ? "accepted" : "declined", r.id);
+      { const ok = hnum(r.id) % 100 < (r.pct >= 50 ? 85 : 55); run("UPDATE requests SET status=? WHERE id=?", ok ? "accepted" : "declined", r.id); if (ok) { award(r.from_id, 25, "match"); award(r.to_id, 25, "match"); } }
     for (const m of all("SELECT m.from_id,m.to_id,MAX(m.id) mid,MAX(m.created) c FROM messages m JOIN users u ON u.id=m.to_id WHERE u.bot=1 GROUP BY m.from_id,m.to_id")) // reply to chat
       if (m.c < now - 1500 && !one("SELECT 1 x FROM messages WHERE from_id=? AND to_id=? AND id>?", m.to_id, m.from_id, m.mid))
         run("INSERT INTO messages(from_id,to_id,text,created) VALUES(?,?,?,?)", m.to_id, m.from_id, pick(BOT_REPLIES), now);
@@ -382,7 +434,7 @@ function botTick() {
     }
     const humans = all("SELECT * FROM users WHERE bot=0 AND seen>?", now - 90000);                          // residents reach out and peek at profiles
     if (humans.length && Math.random() < 0.02) {
-      const h = pick(humans), b = pick(bots), pct = compat(b, h);
+      const h = pick(humans), b = pick(bots), pct = compat(b, h).pct;
       if (pct > 20 && !one("SELECT 1 x FROM requests WHERE (from_id=? AND to_id=?) OR (from_id=? AND to_id=?)", b.id, h.id, h.id, b.id) && !blocked(b.id, h.id))
         run("INSERT INTO requests(from_id,to_id,status,pct,created) VALUES(?,?,'pending',?,?)", b.id, h.id, pct, now);
     }
