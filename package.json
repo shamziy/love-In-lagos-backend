@@ -1,8 +1,0 @@
-{
-  "name": "love-in-lagos-backend",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "engines": { "node": ">=22.13" },
-  "scripts": { "start": "node server.mjs" }
-}
