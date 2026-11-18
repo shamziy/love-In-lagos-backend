@@ -156,6 +156,53 @@ CREATE TABLE IF NOT EXISTS daily_answers(
 
 db.exec("CREATE TABLE IF NOT EXISTS resets(user_id INTEGER PRIMARY KEY,code TEXT NOT NULL,exp INTEGER NOT NULL,tries INTEGER NOT NULL DEFAULT 0)");
 
+// Amebo of the Day: persistent SQLite storage (same database as user accounts).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS amebo_gists(
+    id TEXT PRIMARY KEY,
+    day TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    body TEXT NOT NULL,
+    anonymous INTEGER NOT NULL DEFAULT 1,
+    created INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS amebo_gists_day_idx ON amebo_gists(day, created);
+  CREATE TABLE IF NOT EXISTS amebo_posted(
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    gist_id TEXT NOT NULL,
+    PRIMARY KEY(user_id, day)
+  );
+  CREATE TABLE IF NOT EXISTS amebo_reactions(
+    gist_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    emoji TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY(gist_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS amebo_reports(
+    gist_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY(gist_id, user_id)
+  );
+  CREATE TABLE IF NOT EXISTS amebo_reads(
+    user_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    gist_id TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY(user_id, day, gist_id)
+  );
+  CREATE TABLE IF NOT EXISTS amebo_streaks(
+    user_id INTEGER PRIMARY KEY,
+    streak INTEGER NOT NULL DEFAULT 0,
+    best INTEGER NOT NULL DEFAULT 0,
+    last_day TEXT NOT NULL DEFAULT ''
+  );
+`);
+
+
 try {
   db.exec("ALTER TABLE users ADD COLUMN tv INTEGER NOT NULL DEFAULT 0");
 } catch {}
@@ -499,6 +546,95 @@ async function sendMail(to, subject, text) {
   }
 }
 
+
+const AMEBO_CATEGORIES = new Set(["rel", "fri", "lag", "con", "rnd"]);
+const AMEBO_REACTIONS = new Set(["😂", "👀", "❤️", "🍿", "😭"]);
+const ameboResetAt = () => {
+  const d = new Date(Date.now() + 3600000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 3600000;
+};
+const ameboBump = uid => {
+  const day = lagosDay();
+  const old = one("SELECT streak,last_day FROM amebo_streaks WHERE user_id=?", uid);
+  if (old && old.last_day === day) return;
+  const streak = old && old.last_day === lagosDay(1) ? old.streak + 1 : 1;
+  run(
+    `INSERT INTO amebo_streaks(user_id,streak,best,last_day) VALUES(?,?,?,?)
+     ON CONFLICT(user_id) DO UPDATE SET streak=excluded.streak,
+       best=MAX(amebo_streaks.best,excluded.streak),last_day=excluded.last_day`,
+    uid, streak, streak, day
+  );
+};
+const ameboReactionCounts = gistId => {
+  const counts = {};
+  for (const r of all(
+    "SELECT emoji,COUNT(*) n FROM amebo_reactions WHERE gist_id=? GROUP BY emoji",
+    gistId
+  )) counts[r.emoji] = r.n;
+  return counts;
+};
+const ameboView = (g, viewerId) => {
+  const author = g.anonymous ? null : one(
+    "SELECT id,username,name,avatar FROM users WHERE id=?",
+    g.user_id
+  );
+  return {
+    id: g.id,
+    cat: g.category,
+    text: g.body,
+    at: g.created,
+    anon: !!g.anonymous,
+    author: author ? { ...author, avatar: J(author.avatar, {}) } : null,
+    mine: g.user_id === viewerId,
+    reactions: ameboReactionCounts(g.id),
+    my: one(
+      "SELECT emoji FROM amebo_reactions WHERE gist_id=? AND user_id=?",
+      g.id, viewerId
+    )?.emoji || null
+  };
+};
+const ameboLiveGists = (uid, day = lagosDay()) => all(
+  `SELECT g.* FROM amebo_gists g
+   WHERE g.day=? AND
+   (SELECT COUNT(*) FROM amebo_reports r WHERE r.gist_id=g.id) < 3
+   ORDER BY g.created DESC`,
+  day
+);
+const ameboPrune = () => {
+  const day = lagosDay();
+  run("DELETE FROM amebo_reactions WHERE gist_id IN (SELECT id FROM amebo_gists WHERE day<>?)", day);
+  run("DELETE FROM amebo_reports WHERE gist_id IN (SELECT id FROM amebo_gists WHERE day<>?)", day);
+  run("DELETE FROM amebo_reads WHERE day<>? OR gist_id IN (SELECT id FROM amebo_gists WHERE day<>?)", day, day);
+  run("DELETE FROM amebo_gists WHERE day<>?", day);
+  run("DELETE FROM amebo_posted WHERE day<>?", day);
+};
+const ameboState = uid => {
+  const day = lagosDay();
+  const mine = one(
+    `SELECT g.* FROM amebo_gists g
+     WHERE g.user_id=? AND g.day=? AND
+       (SELECT COUNT(*) FROM amebo_reports r WHERE r.gist_id=g.id) < 3
+     ORDER BY g.created DESC LIMIT 1`,
+    uid, day
+  );
+  const total = one(
+    `SELECT COUNT(*) n FROM amebo_gists g
+     WHERE g.day=? AND g.user_id!=? AND
+       (SELECT COUNT(*) FROM amebo_reports r WHERE r.gist_id=g.id) < 3`,
+    day, uid
+  ).n;
+  const streak = one("SELECT streak,best,last_day FROM amebo_streaks WHERE user_id=?", uid);
+  return {
+    day,
+    resetsAt: ameboResetAt(),
+    total,
+    mine: mine ? ameboView(mine, uid) : null,
+    canPost: !one("SELECT 1 x FROM amebo_posted WHERE user_id=? AND day=?", uid, day),
+    streak: streak && (streak.last_day === day || streak.last_day === lagosDay(1)) ? streak.streak : 0,
+    best: streak?.best || 0
+  };
+};
+
 function route(m, p, url, b, send, ip, req) {
   if (p === "/health" || p === "/api/health") {
     return send(200, { ok: true });
@@ -631,6 +767,154 @@ function route(m, p, url, b, send, ip, req) {
     return send(401, { error: "Please log in" });
   }
 
+
+  if (p.startsWith("/api/amebo")) ameboPrune();
+
+  // Amebo of the Day — shared gists stored in SQLite and reset by Lagos calendar day.
+  if (p === "/api/amebo" && m === "GET") {
+    return send(200, ameboState(uid));
+  }
+
+  if (p === "/api/amebo/next" && m === "GET") {
+    const seen = new Set(String(url.searchParams.get("seen") || "")
+      .split(",").filter(Boolean).slice(0, 200));
+    const readIds = new Set(all(
+      "SELECT gist_id FROM amebo_reads WHERE user_id=? AND day=?",
+      uid, lagosDay()
+    ).map(x => x.gist_id));
+    const pool = ameboLiveGists(uid).filter(g =>
+      g.user_id !== uid && !seen.has(g.id) && !readIds.has(g.id)
+    );
+    const chosen = pool.length ? pool[crypto.randomInt(pool.length)] : null;
+    if (chosen) {
+      run(
+        "INSERT OR IGNORE INTO amebo_reads(user_id,day,gist_id,created) VALUES(?,?,?,?)",
+        uid, lagosDay(), chosen.id, Date.now()
+      );
+      ameboBump(uid);
+    }
+    return send(200, {
+      gist: chosen ? ameboView(chosen, uid) : null,
+      left: Math.max(0, pool.length - (chosen ? 1 : 0))
+    });
+  }
+
+  if (p === "/api/amebo/read" && m === "GET") {
+    const rows = all(
+      `SELECT g.* FROM amebo_reads rd
+       JOIN amebo_gists g ON g.id=rd.gist_id
+       WHERE rd.user_id=? AND rd.day=? AND g.day=?
+         AND (SELECT COUNT(*) FROM amebo_reports r WHERE r.gist_id=g.id) < 3
+         AND EXISTS(SELECT 1 FROM amebo_reactions rx
+                    WHERE rx.gist_id=g.id AND rx.user_id=?)
+       ORDER BY rd.created DESC`,
+      uid, lagosDay(), lagosDay(), uid
+    );
+    return send(200, rows.map(g => ameboView(g, uid)));
+  }
+
+  if (p === "/api/amebo" && m === "POST") {
+    if (!limit(ip, "amebo-post", 5)) return send(429, { error: "Slow down and try again shortly." });
+    const text = String(b.text || "").trim();
+    const category = String(b.cat || "");
+    const day = lagosDay();
+    if (text.length < 10) return send(400, { error: "Say a little more (at least 10 characters)." });
+    if (text.length > 500) return send(400, { error: "Your gist must be 500 characters or fewer." });
+    if (!AMEBO_CATEGORIES.has(category)) return send(400, { error: "Pick a category." });
+    if (one("SELECT 1 x FROM amebo_posted WHERE user_id=? AND day=?", uid, day)) {
+      return send(409, { error: "You already dropped your amebo today. Come back tomorrow!" });
+    }
+    const id = crypto.randomBytes(9).toString("base64url");
+    const created = Date.now();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      // Recheck inside the write transaction to prevent simultaneous duplicate posts.
+      if (one("SELECT 1 x FROM amebo_posted WHERE user_id=? AND day=?", uid, day)) {
+        db.exec("ROLLBACK");
+        return send(409, { error: "You already dropped your amebo today. Come back tomorrow!" });
+      }
+      run(
+        "INSERT INTO amebo_gists(id,day,user_id,category,body,anonymous,created) VALUES(?,?,?,?,?,?,?)",
+        id, day, uid, category, text, b.anon !== false ? 1 : 0, created
+      );
+      run(
+        "INSERT INTO amebo_posted(user_id,day,gist_id) VALUES(?,?,?)",
+        uid, day, id
+      );
+      db.exec("COMMIT");
+    } catch (e) {
+      db.exec("ROLLBACK");
+      throw e;
+    }
+    ameboBump(uid);
+    return send(201, ameboView(one("SELECT * FROM amebo_gists WHERE id=?", id), uid));
+  }
+
+  let am = p.match(/^\/api\/amebo\/([A-Za-z0-9_-]+)(?:\/(react|report))?$/);
+  if (am) {
+    const gist = one(
+      `SELECT g.* FROM amebo_gists g
+       WHERE g.id=? AND g.day=?
+         AND (SELECT COUNT(*) FROM amebo_reports r WHERE r.gist_id=g.id) < 3`,
+      am[1], lagosDay()
+    );
+    if (!gist) return send(404, { error: "That gist has already gone." });
+
+    if (!am[2] && m === "DELETE") {
+      if (gist.user_id !== uid) return send(403, { error: "You can only delete your own gist." });
+      run("DELETE FROM amebo_gists WHERE id=?", gist.id);
+      run("DELETE FROM amebo_reactions WHERE gist_id=?", gist.id);
+      run("DELETE FROM amebo_reports WHERE gist_id=?", gist.id);
+      run("DELETE FROM amebo_reads WHERE gist_id=?", gist.id);
+      // Keep amebo_posted: deleting a post does not permit another post that day.
+      return send(200, { ok: true });
+    }
+
+    if (am[2] === "react" && m === "POST") {
+      if (gist.user_id === uid) return send(400, { error: "You can't react to your own gist." });
+      if (!AMEBO_REACTIONS.has(b.emoji)) return send(400, { error: "Pick a valid reaction." });
+      const old = one(
+        "SELECT emoji FROM amebo_reactions WHERE gist_id=? AND user_id=?",
+        gist.id, uid
+      );
+      if (old?.emoji === b.emoji) {
+        run("DELETE FROM amebo_reactions WHERE gist_id=? AND user_id=?", gist.id, uid);
+      } else {
+        run(
+          `INSERT INTO amebo_reactions(gist_id,user_id,emoji,created) VALUES(?,?,?,?)
+           ON CONFLICT(gist_id,user_id) DO UPDATE SET emoji=excluded.emoji,created=excluded.created`,
+          gist.id, uid, b.emoji, Date.now()
+        );
+      }
+      const v = ameboView(gist, uid);
+      return send(200, { reactions: v.reactions, my: v.my });
+    }
+
+    if (am[2] === "report" && m === "POST") {
+      if (gist.user_id === uid) return send(400, { error: "You can't report your own gist." });
+      if (!limit(ip, "amebo-report", 20)) return send(429, { error: "Slow down and try again shortly." });
+      run(
+        "INSERT OR IGNORE INTO amebo_reports(gist_id,user_id,created) VALUES(?,?,?)",
+        gist.id, uid, Date.now()
+      );
+      const reports = one("SELECT COUNT(*) n FROM amebo_reports WHERE gist_id=?", gist.id).n;
+      return send(200, { ok: true, hidden: reports >= 3 });
+    }
+  }
+
+  // Stack Game rewards: up to 30 XP per run and 60 XP per Lagos day.
+  if (p === "/api/play" && m === "POST") {
+    if (!limit(ip, "stack-game", 120)) return send(429, { error: "Too many game attempts. Take a short break." });
+    const score = Number.isFinite(Number(b.score)) ? Math.max(0, Math.floor(Number(b.score))) : 0;
+    if (score <= 0) return send(200, { xp: 0, message: "No XP earned this run." });
+    const earned = award(uid, Math.min(score, 30), "stack-game", 60);
+    return send(200, {
+      xp: earned,
+      score: Math.min(score, 30),
+      message: earned ? "XP added to your account." : "Daily game XP limit reached."
+    });
+  }
+
   if (p === "/api/me" && m === "GET") return send(200, full(u));
 
   if (p === "/api/me" && m === "PUT") {
@@ -696,6 +980,13 @@ function route(m, p, url, b, send, ip, req) {
       run("DELETE FROM xp_events WHERE user_id=?", uid);
       run("DELETE FROM notifs WHERE user_id=? OR from_id=?", uid, uid);
       run("DELETE FROM cupid WHERE from_id=? OR a=? OR b=?", uid, uid, uid);
+      run("DELETE FROM amebo_reactions WHERE user_id=? OR gist_id IN (SELECT id FROM amebo_gists WHERE user_id=?)", uid, uid);
+      run("DELETE FROM amebo_reports WHERE user_id=? OR gist_id IN (SELECT id FROM amebo_gists WHERE user_id=?)", uid, uid);
+      run("DELETE FROM amebo_reads WHERE user_id=? OR gist_id IN (SELECT id FROM amebo_gists WHERE user_id=?)", uid, uid);
+      run("DELETE FROM amebo_gists WHERE user_id=?", uid);
+      run("DELETE FROM amebo_posted WHERE user_id=?", uid);
+      run("DELETE FROM amebo_streaks WHERE user_id=?", uid);
+
 
       run("DELETE FROM users WHERE id=?", uid);
       db.exec("COMMIT");
