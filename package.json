@@ -1,0 +1,17 @@
+{
+  "name": "love-in-lagos-backend",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node staging-check.mjs --yes-this-is-a-test-database",
+    "check:reset": "node reset-check.mjs --yes-this-is-a-test-database"
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}
